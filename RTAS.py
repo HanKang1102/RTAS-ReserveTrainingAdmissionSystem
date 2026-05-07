@@ -1,6 +1,8 @@
 import sys
 import json
 import os
+import csv
+from datetime import datetime
 os.environ.setdefault("QT_API", "pyside6")
 import io
 import time
@@ -283,8 +285,8 @@ class TrainingSummaryDialog(QDialog):
                     max_columns = 70
                     table_data = [row[:max_columns] for row in table_data]
 
-                    # 2. 줄 수 제한 (2000줄까지만 허용)
-                    max_rows = 2000
+                    # 2. 줄 수 제한 (5000줄까지만 허용)
+                    max_rows = 5000
                     if len(table_data) > max_rows:
                         table_data = table_data[:max_rows]
 
@@ -1010,8 +1012,8 @@ class SaveColumnSelectorDialog(QDialog):
             bottom=Side(style='thin')
         )
 
-        # a1:y2000 범위의 테두리 설정
-        for row in ws.iter_rows(min_row=1, max_row=2000, min_col=1, max_col=25):
+        # a1:y5000 범위의 테두리 설정
+        for row in ws.iter_rows(min_row=1, max_row=5000, min_col=1, max_col=25):
             for cell in row:
                 cell.border = thin_border
 
@@ -1168,8 +1170,8 @@ class MergeFilesDialog(QDialog):
                     max_columns = 70
                     table_data = [row[:max_columns] for row in table_data]
 
-                    # 2. 줄 수 제한 (2000줄까지만 허용)
-                    max_rows = 2000
+                    # 2. 줄 수 제한 (5000줄까지만 허용)
+                    max_rows = 5000
                     if len(table_data) > max_rows:
                         table_data = table_data[:max_rows]
 
@@ -2135,7 +2137,7 @@ class SignatureApp(QWidget):
 
     # GUI 메인 메서드
     def initUI(self):
-        self.setWindowTitle('지역예비군훈련 전자결산 프로그램')  # 윈도우 타이틀 설정
+        self.setWindowTitle('예비군훈련 입소/결산 프로그램')  # 윈도우 타이틀 설정
         self.setGeometry(100, 100, 1800, 400)  # 윈도우 크기와 위치 설정
         mainLayout = QVBoxLayout()  # 메인 레이아웃 생성
 
@@ -2223,6 +2225,43 @@ class SignatureApp(QWidget):
         self.createSignatureFormButton.setGeometry(10, 50, 230, 30)
         self.createSignatureFormButton.clicked.connect(self.createSignatureForm)        
 
+        # (추가) 4번 프레임 안에 배경 이미지 선택 버튼 생성
+        self.selectNoteBgButton = QPushButton('배경 이미지 선택(안내문 배경)', frame4)
+        self.selectNoteBgButton.setGeometry(10, 90, 230, 30)  # ★ 3번째 버튼 위치(원하면 y 조정)
+        self.selectNoteBgButton.clicked.connect(self.selectNoteBackgroundImage)
+
+        # ===== 5번 프레임 추가 및 설정 (4번 프레임 오른쪽) =====
+        frame5 = QFrame(self.controlFrame)
+        frame5.setFrameShape(QFrame.StyledPanel)
+        frame5.setGeometry(1100, 10, 250, 180)  # ★ frame4(840) 오른쪽
+
+        # (1) 배경 이미지 라벨(프레임 전체) + 옅은 투명도 적용
+        self.noteBgLabel = QLabel(frame5)
+        self.noteBgLabel.setGeometry(0, 0, 250, 180)
+        self.noteBgLabel.setScaledContents(True)
+        self.noteBgLabel.lower()  # 다른 위젯 뒤로
+
+        self.noteBgOpacity = QGraphicsOpacityEffect(self.noteBgLabel)
+        self.noteBgOpacity.setOpacity(0.18)  # 0~1, 낮을수록 옅음
+        self.noteBgLabel.setGraphicsEffect(self.noteBgOpacity)
+
+        # (3) 사용자가 입력하는 텍스트 영역 (배경 투명)
+        self.noteTextEdit = QPlainTextEdit(frame5)
+        self.noteTextEdit.setGeometry(10, 10, 225, 160)
+        self.noteTextEdit.setPlaceholderText("여기에 안내 문구를 입력하면 화면에 그대로 표시됩니다.")
+        self.noteTextEdit.setFrameStyle(QFrame.NoFrame)  # 위젯 기본 프레임 제거
+        self.noteTextEdit.setStyleSheet("""
+        QPlainTextEdit {
+            background: transparent;
+            border: none;
+            outline: 0;
+        }
+        QPlainTextEdit:focus {
+            border: none;
+            outline: 0;
+        }
+        """)
+
         self.setLayout(mainLayout)  # 위젯에 메인 레이아웃 설정
 
 # 여기까지 컨트롤 프레임
@@ -2277,6 +2316,15 @@ class SignatureApp(QWidget):
 # 여기서부터 프렘임 외 내용
 
         self.tableWidget = QTableWidget()  # 데이터를 표시할 QTableWidget 생성
+
+        # CSV 자동저장 관련 상태값
+        self.currentCsvAutoSavePath = None
+        self.csvAutoSaveFolderPath = None
+        self.isBulkUpdating = False
+
+        # 표 위젯 셀 수정 감지
+        self.tableWidget.itemChanged.connect(self.handleTableItemChanged)
+
         mainLayout.addWidget(self.tableWidget)  # 테이블 위젯을 메인 레이아웃에 추가
 
         self.tableWidget.itemChanged.connect(self.updateRowCount)  # 테이블 변경 시 레이블 업데이트
@@ -2373,6 +2421,120 @@ class SignatureApp(QWidget):
             data.append(row_data)
         return data
 
+    # CSV 자동 저장 파일 경로를 생성하는 메서드
+    def createAutoCsvFile(self, csv_folder_path):
+        """
+        사용자가 선택한 폴더에 현재 일시(예: 2604152117) 이름으로
+        빈 CSV 파일을 생성하고, 생성된 전체 경로를 반환합니다.
+        """
+        try:
+            # 현재 시각을 yyMMddHHmm 형식으로 생성
+            timestamp = datetime.now().strftime("%y%m%d%H%M")
+            csv_file_path = os.path.join(csv_folder_path, f"{timestamp}.csv")
+
+            # 빈 CSV 파일 생성
+            with open(csv_file_path, mode='w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                # 현재는 빈 파일만 생성
+                # 필요하면 추후 헤더 자동 저장도 여기서 가능
+                writer.writerow([])
+
+            return csv_file_path
+
+        except Exception as e:
+            QMessageBox.critical(self, "CSV 생성 오류", f"CSV 자동 저장 파일 생성 중 오류가 발생했습니다:\n{e}")
+            return None
+
+    # CSV 자동 저장 폴더 선택 + 파일 생성 메서드
+    def selectCsvAutoSaveFolder(self):
+        """
+        CSV 자동 저장용 폴더를 선택받고,
+        해당 폴더에 현재 일시 이름의 CSV 파일을 자동 생성합니다.
+        """
+        csv_folder_path = QFileDialog.getExistingDirectory(self, "백업 데이터 저장 폴더 선택")
+        if not csv_folder_path:
+            QMessageBox.warning(self, "경로 선택 오류", "CSV 데이터를 저장할 폴더가 선택되지 않았습니다.")
+            return None
+
+        self.csvAutoSaveFolderPath = csv_folder_path
+        self.csvAutoSaveFilePath = self.createAutoCsvFile(csv_folder_path)
+
+        if not self.csvAutoSaveFilePath:
+            return None
+
+        QMessageBox.information(
+            self,
+            "CSV 자동 저장 파일 생성 완료",
+            f"CSV 자동 저장 파일이 생성되었습니다.\n{self.csvAutoSaveFilePath}"
+        )
+        return self.csvAutoSaveFilePath
+    
+    def isBadgeColumn(self, column_name):
+        """
+        사용자가 수정한 열이 1~5일차 표찰 열인지 확인
+        """
+        badge_columns = [
+            '1일차 표찰',
+            '2일차 표찰',
+            '3일차 표찰',
+            '4일차 표찰',
+            '5일차 표찰'
+        ]
+        return column_name in badge_columns
+
+    def saveTableDataToCsv(self):
+        """
+        현재 위젯 전체 데이터를 currentCsvAutoSavePath 에 CSV로 덮어쓰기 저장
+        """
+        try:
+            if not self.currentCsvAutoSavePath:
+                return
+
+            table_data = self.getTableData()
+
+            if not table_data:
+                with open(self.currentCsvAutoSavePath, mode='w', newline='', encoding='utf-8-sig') as f:
+                    pass
+                return
+
+            headers = list(table_data[0].keys())
+
+            with open(self.currentCsvAutoSavePath, mode='w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(table_data)
+
+            print(f"CSV 자동저장 완료: {self.currentCsvAutoSavePath}")
+
+        except Exception as e:
+            print(f"CSV 자동저장 중 오류 발생: {e}")
+
+    def handleTableItemChanged(self, item):
+        """
+        위젯 셀이 수정될 때 호출됨.
+        단, 1~5일차 표찰 열이 수정된 경우에만 CSV 자동저장 수행
+        """
+        try:
+            if self.isBulkUpdating:
+                return
+
+            if item is None:
+                return
+
+            header_item = self.tableWidget.horizontalHeaderItem(item.column())
+            if header_item is None:
+                return
+
+            column_name = header_item.text()
+
+            if not self.isBadgeColumn(column_name):
+                return
+
+            self.saveTableDataToCsv()
+
+        except Exception as e:
+            print(f"itemChanged 처리 중 오류 발생: {e}")
+
     # 전자서명 명부 종합하기 버튼의 클릭 이벤트에 연결될 메서드
     def openMergeDialog(self):
         # 서명 이미지 경로 설정 다이얼로그 표시
@@ -2395,27 +2557,38 @@ class SignatureApp(QWidget):
     # 전자서명 명부 불러오기 위한 선택 메서드
     def selectFile(self):
 
-        # 2단계: 사용자로부터 서명 이미지 저장 경로 선택받기
+        # 1단계: 사용자로부터 서명 이미지 저장 경로 선택받기
         savePath = QFileDialog.getExistingDirectory(self, "서명 이미지 저장 경로 선택")
         if not savePath:
-            # 사용자가 경로 선택을 취소했다면, 이후의 로직을 실행하지 않음
             QMessageBox.warning(self, "경로 선택 오류", "서명 이미지를 저장할 경로가 선택되지 않았습니다.")
             return
         else:
-            self.signatureSavePath = savePath  # 선택된 경로 저장
-            self.signatureSavePathLabel.setText(f"서명 이미지 폴더: {savePath}")  # 레이블에 경로 표시
+            self.signatureSavePath = savePath
+            self.signatureSavePathLabel.setText(f"서명 이미지 폴더: {savePath}")
 
-        # 3단계: 사용자로부터 파일 선택받기
-        fname, _ = QFileDialog.getOpenFileName(self, 'Open file', './', 'hcell files (*.cell)')
+        # 2단계: CSV 자동 저장용 폴더 선택 후 현재 일시 이름의 CSV 파일 자동 생성
+        created_csv_path = self.selectCsvAutoSaveFolder()
+        if not created_csv_path:
+            return
+
+        # 필요하면 이후 다른 저장 로직에서도 사용할 수 있도록 경로 보관
+        self.currentCsvAutoSavePath = created_csv_path
+
+        # 3단계: 사용자로부터 전자서명 명부 파일 선택받기
+        fname, _ = QFileDialog.getOpenFileName(
+            self,
+            'Open file',
+            './',
+            '지원 파일 (*.cell *.csv);;HCell files (*.cell);;CSV files (*.csv)'
+        )
         if not fname:
             QMessageBox.warning(self, "파일 선택 오류", "파일이 선택되지 않았습니다.")
             return
-        self.fileNameLabel.setText(f"선택된 파일: {fname}")  # 선택된 파일 이름을 레이블에 표시
+        self.fileNameLabel.setText(f"선택된 파일: {fname}")
 
         # 4단계: 선택된 파일 처리
         try:
-            # os.startfile을 사용하여 파일 열기
-            os.startfile(fname)
+            file_ext = os.path.splitext(fname)[1].lower()
 
             # 테이블 형태로 데이터를 입력할 수 있는 창 생성
             tableDialog = QDialog(self)
@@ -2423,39 +2596,50 @@ class SignatureApp(QWidget):
             layout = QVBoxLayout(tableDialog)
 
             # 설명 라벨 추가
-            instructionsLabel = QLabel("엑셀에서 데이터를 복사하여 아래 텍스트 박스에 붙여넣기 하십시오.")
+            if file_ext == '.csv':
+                instructionsLabel = QLabel("CSV 파일 내용이 자동으로 입력되었습니다. 내용을 확인한 뒤 [확인]을 누르십시오.")
+            else:
+                instructionsLabel = QLabel("엑셀에서 데이터를 복사하여 아래 텍스트 박스에 붙여넣기 하십시오.")
             layout.addWidget(instructionsLabel)
 
             # 텍스트 에디터 추가
             textEdit = QPlainTextEdit()
             layout.addWidget(textEdit)
 
+            # .cell 파일이면 기존처럼 한셀로 열기
+            if file_ext == '.cell':
+                os.startfile(fname)
+
             # 텍스트가 변경될 때마다 호출되는 함수 정의
             def validateText():
                 copied_data = textEdit.toPlainText().strip()
-                table_data = [row.split('\t') for row in copied_data.split('\n')]
+                table_data = [row.split('\t') for row in copied_data.split('\n') if row.strip()]
 
                 # 1. 각 줄의 열 수를 제한하여 70열을 넘는 데이터를 제거
                 max_columns = 70
                 table_data = [row[:max_columns] for row in table_data]
 
-                # 2. 줄 수 제한 (2000줄까지만 허용)
-                max_rows = 2000
+                # 2. 줄 수 제한 (5000줄까지만 허용)
+                max_rows = 5000
                 if len(table_data) > max_rows:
                     table_data = table_data[:max_rows]
 
                 # 수정된 데이터를 다시 텍스트로 변환하여 텍스트 에디터에 입력
                 corrected_text = '\n'.join(['\t'.join(row) for row in table_data])
-                
-                # 텍스트가 다르면 수정된 텍스트로 교체
+
                 if corrected_text != copied_data:
-                    # 이벤트 일시 중지
                     textEdit.blockSignals(True)
                     textEdit.setPlainText(corrected_text)
                     textEdit.blockSignals(False)
 
             # 텍스트가 변경될 때마다 validateText 함수를 호출
             textEdit.textChanged.connect(validateText)
+
+            # CSV 파일이면 자동으로 textEdit에 데이터 채우기
+            if file_ext == '.csv':
+                loaded = self.loadCsvToTextEdit(fname, textEdit)
+                if not loaded:
+                    return
 
             # 확인 버튼 추가
             confirmButton = QPushButton("확인", tableDialog)
@@ -2467,6 +2651,37 @@ class SignatureApp(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "오류 발생", f"파일을 불러오는 데 실패했습니다: {e}")
+
+    def loadCsvToTextEdit(self, csv_file_path, textEdit):
+        """
+        CSV 파일 내용을 읽어서 데이터 확인 및 입력 창의 textEdit에
+        탭(\t) 구분 텍스트 형태로 자동 입력
+        """
+        try:
+            table_data = []
+
+            with open(csv_file_path, mode='r', newline='', encoding='utf-8-sig') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    table_data.append(row)
+
+            if not table_data:
+                QMessageBox.warning(self, "CSV 불러오기 오류", "CSV 파일이 비어 있습니다.")
+                return False
+
+            # CSV -> 탭 구분 텍스트로 변환
+            text_data = '\n'.join(['\t'.join(map(str, row)) for row in table_data])
+
+            # textChanged(validateText)와 충돌하지 않도록 잠시 block
+            textEdit.blockSignals(True)
+            textEdit.setPlainText(text_data)
+            textEdit.blockSignals(False)
+
+            return True
+
+        except Exception as e:
+            QMessageBox.critical(self, "CSV 불러오기 오류", f"CSV 파일을 읽는 중 오류가 발생했습니다:\n{e}")
+            return False
 
     def processCopiedData(self, textEdit, tableDialog):
         copied_data = textEdit.toPlainText().strip()
@@ -2487,207 +2702,214 @@ class SignatureApp(QWidget):
 
     # 전자서명 명부로 불러온 파일을 화면에 보여주는 메서드            
     def displayDataInTable(self, table_data, columnSelections, idColumnIndex):
-        # 기존 데이터의 열 제목 읽기
-        headers = table_data[0]
-        print(f"Headers: {headers}")  # 디버깅 출력
 
-        # 테이블 업데이트 비활성화
-        self.tableWidget.setUpdatesEnabled(False)        
+        # 대량 데이터 반영 중에는 자동저장 방지
+        self.isBulkUpdating = True
 
-        # 기존에 'ID' 열이 있는지 확인
-        id_present = 'ID' in headers
-        if id_present:
-            idColumnIndex = headers.index('ID')
-            headers.pop(idColumnIndex)  # 기존 'ID' 열 제목 제거
-        headers = ['ID'] + headers  # 새로운 'ID' 열을 제목에 추가
-        self.tableWidget.setColumnCount(len(headers))  # 열 수 조정
+        # 현재 정렬 상태 백업
+        previous_sorting_enabled = self.tableWidget.isSortingEnabled()
 
-        self.tableWidget.setHorizontalHeaderLabels(headers)  # 열 제목 설정
-        # 데이터 로우 설정 (두 번째 행부터 시작)
-        self.tableWidget.setRowCount(len(table_data) - 1)  # 첫 번째 행(제목)을 제외한 나머지 행 수
+        try:
+            # 기존 데이터의 열 제목 읽기
+            headers = table_data[0]
+            print(f"Headers: {headers}")  # 디버깅 출력
 
-        # 선택된 열의 인덱스를 찾거나 빈 문자열로 설정합니다.
-        def get_corrected_index(col_name):
-            original_index = headers.index(col_name) if col_name in headers else -1
-            if id_present and original_index >= idColumnIndex:
-                return original_index + 1  # ID 열을 제거한 후 인덱스 조정
-            return original_index
+            # 로딩 중 UI/시그널/정렬 갱신 최소화
+            self.tableWidget.setUpdatesEnabled(False)
+            self.tableWidget.blockSignals(True)
+            self.tableWidget.setSortingEnabled(False)
+            self.tableWidget.viewport().setUpdatesEnabled(False)
+            self.tableWidget.horizontalHeader().setUpdatesEnabled(False)
+            self.tableWidget.verticalHeader().setUpdatesEnabled(False)
 
-        trainingStartDayIndex = get_corrected_index(columnSelections.get('훈련시작일차 열 선택'))
-        trainingEndDayIndex = get_corrected_index(columnSelections.get('훈련종료일차 열 선택'))
-        nameIndex = get_corrected_index(columnSelections.get('성명 열 선택'))
-        birthDateIndex = get_corrected_index(columnSelections.get('생년월일 열 선택'))
-        trainingTypeIndex = get_corrected_index(columnSelections.get('훈련유형 열 선택'))
-        individualSequenceIndex = get_corrected_index(columnSelections.get('개인차수 열 선택'))
-        totalPlanTimeIndex = get_corrected_index(columnSelections.get('총 계획시간 열 선택'))
+            # 기존에 'ID' 열이 있는지 확인
+            id_present = 'ID' in headers
+            if id_present:
+                idColumnIndex = headers.index('ID')
+                headers.pop(idColumnIndex)  # 기존 'ID' 열 제목 제거
 
-        dailyTrainingTimeIndexes = [
-            get_corrected_index(columnSelections.get('1일차 훈련시간 열 선택')),
-            get_corrected_index(columnSelections.get('2일차 훈련시간 열 선택')),
-            get_corrected_index(columnSelections.get('3일차 훈련시간 열 선택')),
-            get_corrected_index(columnSelections.get('4일차 훈련시간 열 선택')),
-            get_corrected_index(columnSelections.get('5일차 훈련시간 열 선택'))
-        ]
+            headers = ['ID'] + headers  # 새로운 'ID' 열을 제목에 추가
 
-        # 디버깅 출력
-        print(f"Column Selections: {columnSelections}")
-        print(f"Training Start Day Index: {trainingStartDayIndex} (열 이름: {headers[trainingStartDayIndex] if trainingStartDayIndex != -1 else 'N/A'})")
-        print(f"Training End Day Index: {trainingEndDayIndex} (열 이름: {headers[trainingEndDayIndex] if trainingEndDayIndex != -1 else 'N/A'})")
-        print(f"Name Index: {nameIndex} (열 이름: {headers[nameIndex] if nameIndex != -1 else 'N/A'})")
-        print(f"Birth Date Index: {birthDateIndex} (열 이름: {headers[birthDateIndex] if birthDateIndex != -1 else 'N/A'})")
-        print(f"Training Type Index: {trainingTypeIndex} (열 이름: {headers[trainingTypeIndex] if trainingTypeIndex != -1 else 'N/A'})")
-        print(f"Individual Sequence Index: {individualSequenceIndex} (열 이름: {headers[individualSequenceIndex] if individualSequenceIndex != -1 else 'N/A'})")
-        print(f"Total Plan Time Index: {totalPlanTimeIndex} (열 이름: {headers[totalPlanTimeIndex] if totalPlanTimeIndex != -1 else 'N/A'})")
+            col_count = len(headers)
+            row_count = len(table_data) - 1
 
-        for i, index in enumerate(dailyTrainingTimeIndexes, start=1):
-            print(f"Day {i} Training Time Index: {index} (열 이름: {headers[index] if index != -1 else 'N/A'})")
+            self.tableWidget.setColumnCount(col_count)
+            self.tableWidget.setHorizontalHeaderLabels(headers)
+            self.tableWidget.setRowCount(row_count)
 
-        # 모든 행에 대해 새로운 'ID' 값을 계산하고 나머지 데이터와 함께 테이블에 설정
-        for row in range(1, len(table_data)):
-            # 새로운 'ID' 값을 구성하기 위한 데이터 추출
-            idValues = []
-            missingColumns = []  # 데이터가 없는 열을 기록하는 리스트
-            
-            # try-except 블록으로 인덱스 에러 방지
-            try:
-                # 각 열에 대해 데이터를 확인하고, 없으면 경고창에 알림을 추가합니다.
-                for colName, colIndex in zip(['성명', '생년월일', '훈련유형', '개인차수'], 
-                                            [nameIndex - 1, birthDateIndex - 1, trainingTypeIndex - 1, individualSequenceIndex - 1]):
-                    if colIndex != -1 and colIndex < len(table_data[row]):  # 인덱스 유효성 검사
-                        cellValue = table_data[row][colIndex]
-                        if cellValue is not None:
-                            if isinstance(cellValue, float) and cellValue.is_integer():
-                                cellValue = int(cellValue)
-                            cellValue = str(cellValue)
-                            idValues.append(cellValue)  # ID 구성 값 추가
-                        else:
-                            missingColumns.append(colName)  # 값이 없는 열 기록
-                    else:
-                        missingColumns.append(colName)  # 인덱스 범위를 벗어난 열 기록
-                
-                # 데이터가 없는 열이 있을 경우 경고 메시지 표시
-                if missingColumns:
-                    missingColsString = ", ".join(missingColumns)
-                    QMessageBox.warning(self, "데이터 오류", f"행 {row}에서 다음 열에 데이터가 없습니다: {missingColsString}")
-                
-                # ID 값 생성
-                idValue = "_".join(idValues) if idValues else ""
+            # 선택된 열의 인덱스를 찾거나 빈 문자열로 설정합니다.
+            def get_corrected_index(col_name):
+                original_index = headers.index(col_name) if col_name in headers else -1
+                if id_present and original_index >= idColumnIndex:
+                    return original_index + 1  # ID 열을 제거한 후 인덱스 조정
+                return original_index
 
-                if not idValue:  # ID 열이 없는 경우 해당 행을 건너뛰기
-                    continue
+            trainingStartDayIndex = get_corrected_index(columnSelections.get('훈련시작일차 열 선택'))
+            trainingEndDayIndex = get_corrected_index(columnSelections.get('훈련종료일차 열 선택'))
+            nameIndex = get_corrected_index(columnSelections.get('성명 열 선택'))
+            birthDateIndex = get_corrected_index(columnSelections.get('생년월일 열 선택'))
+            trainingTypeIndex = get_corrected_index(columnSelections.get('훈련유형 열 선택'))
+            individualSequenceIndex = get_corrected_index(columnSelections.get('개인차수 열 선택'))
+            totalPlanTimeIndex = get_corrected_index(columnSelections.get('총 계획시간 열 선택'))
 
-                # 테이블에 새로운 'ID' 열 값 설정
-                self.tableWidget.setItem(row - 1, 0, QTableWidgetItem(idValue))
-
-            except IndexError as e:
-                # 예외 처리: 인덱스 에러 발생 시 경고창만 띄우고 프로그램 종료 방지
-                QMessageBox.critical(self, "인덱스 오류", f"행 {row}에서 인덱스 오류가 발생했습니다: {e}")
-                continue  # 다음 행으로 넘어가서 계속 실행
-
-            adjustedColumnIndex = 1  # 새로운 'ID' 열 이후부터 시작
-            # 'ID' 열 제외하고 값을 읽어옴
-            for col in range(0, len(table_data[0])):
-                if col == idColumnIndex:  # 'ID' 열이면 건너뛰기
-                    continue
-
-                value = table_data[row][col] if col < len(table_data[row]) else None  # 셀 값 가져오기
-                if value is None:  # 값이 None이면 빈 문자열로 처리
-                    displayValue = ""
-                elif isinstance(value, float) and value.is_integer():
-                    value = int(value)  # 부동소수점 수가 정수면 정수 형태로 변환
-                    displayValue = str(value)
-                else:
-                    displayValue = str(value)
-
-                # 빈 값, '0', '00', '000' 조건 검사
-                if displayValue in ['', '0', '00', '000']:
-                    displayValue = ""  # 이 조건들을 만족하면 테이블에 아무것도 표시하지 않음
-
-                item = QTableWidgetItem(displayValue)
-                self.tableWidget.setItem(row - 1, adjustedColumnIndex, item)  # 테이블에 데이터 설정
-                adjustedColumnIndex += 1  # 열 인덱스 조정
-
-            # 총 계획시간, 훈련시작일차, 훈련종료일차 인덱스를 조정하여 가져오기
-            adjustedTotalPlanTimeIndex = totalPlanTimeIndex - 1 if totalPlanTimeIndex > 0 else totalPlanTimeIndex
-            adjustedTrainingStartDayIndex = trainingStartDayIndex - 1 if trainingStartDayIndex > 0 else trainingStartDayIndex
-            adjustedTrainingEndDayIndex = trainingEndDayIndex - 1 if trainingEndDayIndex > 0 else trainingEndDayIndex
-
-            # 총 계획시간, 훈련시작일차, 훈련종료일차 읽기
-            totalPlanHoursValue = table_data[row][adjustedTotalPlanTimeIndex] if adjustedTotalPlanTimeIndex != -1 and adjustedTotalPlanTimeIndex < len(table_data[row]) else '0'
-            print(f"행 {row-1}: 총 계획시간 값: {totalPlanHoursValue}")
-
-            if totalPlanHoursValue in [None, '']:
-                totalPlanHours = 0  # None이거나 빈 문자열일 경우 0으로 설정
-            else:
-                try:
-                    totalPlanHours = float(totalPlanHoursValue)
-                except ValueError:
-                    print(f"행 {row-1}: 총 계획시간 값을 float로 변환하는 중 오류: {totalPlanHoursValue}")
-                    totalPlanHours = 0  # 기본값 설정 또는 다른 처리
-            print(f"행 {row-1}: 총 계획시간: {totalPlanHours}")
-
-            # 훈련시작일차와 훈련종료일차가 숫자인지 확인
-            startDayValue = table_data[row][adjustedTrainingStartDayIndex] if adjustedTrainingStartDayIndex != -1 and adjustedTrainingStartDayIndex < len(table_data[row]) else '1'
-            endDayValue = table_data[row][adjustedTrainingEndDayIndex] if adjustedTrainingEndDayIndex != -1 and adjustedTrainingEndDayIndex < len(table_data[row]) else '5'
-            print(f"행 {row-1}: 시작일차 원본 값: {startDayValue}, 종료일차 원본 값: {endDayValue}")
-
-            try:
-                startDay = int(startDayValue)
-            except ValueError:
-                print(f"행 {row-1}: 시작일차 값을 int로 변환하는 중 오류: {startDayValue}")
-                startDay = 1  # 기본값으로 설정하거나 다른 처리
-            print(f"행 {row-1}: 시작일차: {startDay}")
-
-            # 종료일차 값에서 숫자만 추출
-            import re
-            endDayValueNumbers = re.findall(r'\d+', endDayValue)
-            endDayValue = endDayValueNumbers[0] if endDayValueNumbers else '5'
-
-            try:
-                endDay = int(endDayValue)
-            except ValueError:
-                print(f"행 {row-1}: 종료일차 값을 int로 변환하는 중 오류: {endDayValue}")
-                endDay = 5  # 기본값으로 설정하거나 다른 처리
-            print(f"행 {row-1}: 종료일차: {endDay}")
+            dailyTrainingTimeIndexes = [
+                get_corrected_index(columnSelections.get('1일차 훈련시간 열 선택')),
+                get_corrected_index(columnSelections.get('2일차 훈련시간 열 선택')),
+                get_corrected_index(columnSelections.get('3일차 훈련시간 열 선택')),
+                get_corrected_index(columnSelections.get('4일차 훈련시간 열 선택')),
+                get_corrected_index(columnSelections.get('5일차 훈련시간 열 선택'))
+            ]
 
             # 디버깅 출력
-            print(f"행 {row-1}: 총 계획시간: {totalPlanHours}, 시작일차: {startDay}, 종료일차: {endDay}")
+            print(f"Column Selections: {columnSelections}")
+            print(f"Training Start Day Index: {trainingStartDayIndex} (열 이름: {headers[trainingStartDayIndex] if trainingStartDayIndex != -1 else 'N/A'})")
+            print(f"Training End Day Index: {trainingEndDayIndex} (열 이름: {headers[trainingEndDayIndex] if trainingEndDayIndex != -1 else 'N/A'})")
+            print(f"Name Index: {nameIndex} (열 이름: {headers[nameIndex] if nameIndex != -1 else 'N/A'})")
+            print(f"Birth Date Index: {birthDateIndex} (열 이름: {headers[birthDateIndex] if birthDateIndex != -1 else 'N/A'})")
+            print(f"Training Type Index: {trainingTypeIndex} (열 이름: {headers[trainingTypeIndex] if trainingTypeIndex != -1 else 'N/A'})")
+            print(f"Individual Sequence Index: {individualSequenceIndex} (열 이름: {headers[individualSequenceIndex] if individualSequenceIndex != -1 else 'N/A'})")
+            print(f"Total Plan Time Index: {totalPlanTimeIndex} (열 이름: {headers[totalPlanTimeIndex] if totalPlanTimeIndex != -1 else 'N/A'})")
 
-            # 수정된 일차별 훈련시간 계산 로직
-            if totalPlanHours > 0:
-                # 계획된 훈련 기간에 맞게 시간 분배
-                allocatedHours = [0] * 5  # 각 일차별로 할당된 시간을 저장할 리스트
-                print(f"행 {row-1}: 초기 할당 시간: {allocatedHours}")
+            for i, index in enumerate(dailyTrainingTimeIndexes, start=1):
+                print(f"Day {i} Training Time Index: {index} (열 이름: {headers[index] if index != -1 else 'N/A'})")
 
-                # 새로운 로직: 각 일차에 최대 8시간 할당
-                remainingHours = totalPlanHours
-                print(f"행 {row-1}: 초기 남은 시간: {remainingHours}")
+            # 반복 호출 비용을 조금 줄이기 위해 지역 변수로 바인딩
+            set_item = self.tableWidget.setItem
+            item_class = QTableWidgetItem
 
-                for day in range(startDay, endDay + 1):
-                    print(f"행 {row-1}: 일차: {day}, 남은 시간: {remainingHours}")
+            # 모든 행에 대해 새로운 'ID' 값을 계산하고 나머지 데이터와 함께 테이블에 설정
+            for row in range(1, len(table_data)):
+                # 새로운 'ID' 값을 구성하기 위한 데이터 추출
+                idValues = []
+                missingColumns = []  # 데이터가 없는 열을 기록하는 리스트
 
-                    if remainingHours > 8:
-                        allocatedHours[day-1] = 8
-                        remainingHours -= 8
+                try:
+                    # 각 열에 대해 데이터를 확인하고, 없으면 경고창에 알림을 추가합니다.
+                    for colName, colIndex in zip(
+                        ['성명', '생년월일', '훈련유형', '개인차수'],
+                        [nameIndex - 1, birthDateIndex - 1, trainingTypeIndex - 1, individualSequenceIndex - 1]
+                    ):
+                        if colIndex != -1 and colIndex < len(table_data[row]):  # 인덱스 유효성 검사
+                            cellValue = table_data[row][colIndex]
+                            if cellValue is not None:
+                                if isinstance(cellValue, float) and cellValue.is_integer():
+                                    cellValue = int(cellValue)
+                                idValues.append(str(cellValue))
+                            else:
+                                missingColumns.append(colName)
+                        else:
+                            missingColumns.append(colName)
+
+                    # 데이터가 없는 열이 있으면 경고창에 표시
+                    if missingColumns:
+                        print(f"행 {row}: ID 생성에 필요한 열 누락 -> {missingColumns}")
+
+                    idValue = "_".join(idValues) if idValues else ""
+
+                    if not idValue:  # ID 열이 없는 경우 해당 행을 건너뛰기
+                        continue
+
+                    # 테이블에 새로운 'ID' 열 값 설정
+                    set_item(row - 1, 0, item_class(idValue))
+
+                except IndexError as e:
+                    # 예외 처리: 인덱스 에러 발생 시 경고창만 띄우고 프로그램 종료 방지
+                    QMessageBox.critical(self, "인덱스 오류", f"행 {row}에서 인덱스 오류가 발생했습니다: {e}")
+                    continue  # 다음 행으로 넘어가서 계속 실행
+
+                adjustedColumnIndex = 1  # 새로운 'ID' 열 이후부터 시작
+
+                # 'ID' 열 제외하고 값을 읽어옴
+                for col in range(0, len(table_data[0])):
+                    if col == idColumnIndex:  # 'ID' 열이면 건너뛰기
+                        continue
+
+                    value = table_data[row][col] if col < len(table_data[row]) else None  # 셀 값 가져오기
+                    if value is None:  # 값이 None이면 빈 문자열로 처리
+                        displayValue = ""
+                    elif isinstance(value, float) and value.is_integer():
+                        value = int(value)  # 부동소수점 수가 정수면 정수 형태로 변환
+                        displayValue = str(value)
                     else:
-                        allocatedHours[day-1] = remainingHours
-                        break  # 남은 시간이 8시간 이하이면 할당 후 반복문 종료
+                        displayValue = str(value)
 
-                    print(f"행 {row-1}: {day}일차 후 할당 시간: {allocatedHours}, 남은 시간: {remainingHours}")
+                    # 빈 값, '0', '00', '000' 조건 검사
+                    if displayValue in ['', '0', '00', '000']:
+                        displayValue = ""
 
-                # 할당된 시간을 테이블에 설정
-                for day, hours in enumerate(allocatedHours, start=1):
-                    if day >= startDay and day <= endDay:
-                        # ID 열이 추가된 이후의 열 인덱스를 조정하여 올바른 위치에 시간을 설정합니다.
-                        dayIndex = dailyTrainingTimeIndexes[day - 1] - 1 if id_present else dailyTrainingTimeIndexes[day - 1]
-                        print(f"행 {row-1}, {day}일차: 할당 시간: {hours}, 일차 인덱스: {dayIndex}")
+                    item = item_class(displayValue)
+                    set_item(row - 1, adjustedColumnIndex, item)
+                    adjustedColumnIndex += 1
 
-                        if dayIndex != -1:  # 유효한 인덱스인 경우에만 설정
-                            print(f"행 {row-1}, {day}일차: 인덱스 {dayIndex}에 시간 {hours} 설정")
-                            self.tableWidget.setItem(row - 1, dayIndex, QTableWidgetItem(str(int(hours))))
+                # 총 계획시간, 훈련시작일차, 훈련종료일차 인덱스를 조정하여 가져오기
+                adjustedTotalPlanTimeIndex = totalPlanTimeIndex - 1 if totalPlanTimeIndex > 0 else totalPlanTimeIndex
+                adjustedTrainingStartDayIndex = trainingStartDayIndex - 1 if trainingStartDayIndex > 0 else trainingStartDayIndex
+                adjustedTrainingEndDayIndex = trainingEndDayIndex - 1 if trainingEndDayIndex > 0 else trainingEndDayIndex
 
-        # 테이블 업데이트 재활성화
-        self.tableWidget.setUpdatesEnabled(True)
+                # 총 계획시간, 훈련시작일차, 훈련종료일차 읽기
+                totalPlanHoursValue = table_data[row][adjustedTotalPlanTimeIndex] if adjustedTotalPlanTimeIndex != -1 and adjustedTotalPlanTimeIndex < len(table_data[row]) else '0'
+                print(f"행 {row-1}: 총 계획시간 값: {totalPlanHoursValue}")
+
+                if totalPlanHoursValue in [None, '']:
+                    totalPlanHours = 0
+                else:
+                    try:
+                        totalPlanHours = int(float(totalPlanHoursValue))
+                    except ValueError:
+                        totalPlanHours = 0
+
+                startDayValue = table_data[row][adjustedTrainingStartDayIndex] if adjustedTrainingStartDayIndex != -1 and adjustedTrainingStartDayIndex < len(table_data[row]) else '1'
+                endDayValue = table_data[row][adjustedTrainingEndDayIndex] if adjustedTrainingEndDayIndex != -1 and adjustedTrainingEndDayIndex < len(table_data[row]) else '1'
+
+                try:
+                    startDay = int(float(startDayValue)) if startDayValue not in [None, ''] else 1
+                except ValueError:
+                    startDay = 1
+
+                try:
+                    endDay = int(float(endDayValue)) if endDayValue not in [None, ''] else 1
+                except ValueError:
+                    endDay = 1
+
+                trainingDays = max(1, endDay - startDay + 1)
+                baseHoursPerDay = totalPlanHours // trainingDays if trainingDays > 0 else 0
+                remainingHours = totalPlanHours % trainingDays if trainingDays > 0 else 0
+
+                print(f"행 {row-1}: startDay={startDay}, endDay={endDay}, trainingDays={trainingDays}, baseHoursPerDay={baseHoursPerDay}, remainingHours={remainingHours}")
+
+                # 각 일차별 훈련시간 자동 입력
+                for day in range(1, 6):
+                    trainingTimeCol = dailyTrainingTimeIndexes[day - 1]
+                    if trainingTimeCol == -1:
+                        continue
+
+                    adjustedTrainingTimeCol = trainingTimeCol - 1 if trainingTimeCol > 0 else trainingTimeCol
+
+                    if startDay <= day <= endDay:
+                        dayOffset = day - startDay
+                        dayHours = baseHoursPerDay + (1 if dayOffset < remainingHours else 0)
+
+                        # 실제 테이블 컬럼 위치는 ID 추가 후 기준이므로 trainingTimeCol 그대로 사용
+                        existing_item = self.tableWidget.item(row - 1, trainingTimeCol)
+                        if existing_item is None or existing_item.text() in ['', '0', '00', '000']:
+                            set_item(row - 1, trainingTimeCol, item_class(str(dayHours)))
+                    else:
+                        existing_item = self.tableWidget.item(row - 1, trainingTimeCol)
+                        if existing_item is None or existing_item.text() in ['0', '00', '000']:
+                            set_item(row - 1, trainingTimeCol, item_class(""))
+
+            # 행 개수 라벨 갱신
+            self.updateRowCount()
+
+        finally:
+            # 로딩 종료 후 원래 상태 복구
+            self.tableWidget.setSortingEnabled(previous_sorting_enabled)
+            self.tableWidget.blockSignals(False)
+            self.tableWidget.viewport().setUpdatesEnabled(True)
+            self.tableWidget.horizontalHeader().setUpdatesEnabled(True)
+            self.tableWidget.verticalHeader().setUpdatesEnabled(True)
+            self.tableWidget.setUpdatesEnabled(True)
+            self.isBulkUpdating = False
 
     # 복호화된 데이터 위젯 표시 메서드
     def displayDecryptedData(self, data):
@@ -3056,6 +3278,27 @@ class SignatureApp(QWidget):
             QMessageBox.information(self, '성공', '전자서명 명부 서식이 성공적으로 생성되었습니다.')
         except Exception as e:
             QMessageBox.critical(self, '오류 발생', f'서식을 생성하는 동안 오류가 발생했습니다: {e}')
+
+    # 5번째 프레임 배경 이미지 선택 관련 메서드
+    def selectNoteBackgroundImage(self):
+        filePath, _ = QFileDialog.getOpenFileName(
+            self, "배경 이미지 선택", "./", "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        if not filePath:
+            return
+
+        pix = QPixmap(filePath)
+        if pix.isNull():
+            QMessageBox.warning(self, "오류", "이미지를 불러오지 못했습니다.")
+            return
+
+        # frame5 라벨 크기에 맞춰 '채우기(cover)' 느낌으로 확장
+        scaled = pix.scaled(
+            self.noteBgLabel.size(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation
+        )
+        self.noteBgLabel.setPixmap(scaled)
 
 # 여기까지 컨트롤 프레임 관련 메서드
                 
